@@ -1,86 +1,95 @@
 import os
 import json
 import logging
-import asyncio
-
-from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-    ConversationHandler,
-)
-
+from flask import Flask
+from dotenv import load_dotenv
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
 
-# Логгирование
+# Загрузка .env
+load_dotenv()
+
+# Настройка логирования
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
-# Подключение к Google Sheets
+# Flask сервер
+app = Flask(__name__)
+
+# Google таблица: парсим ключ из строки окружения
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-google_creds_str = os.environ["GOOGLE_CREDS_JSON"]
+google_creds_str = os.getenv("GOOGLE_CREDS_JSON")
+
+if not google_creds_str:
+    raise Exception("GOOGLE_CREDS_JSON не найдена в переменных окружения")
+
+# Парсим строку JSON в словарь
 google_creds = json.loads(google_creds_str)
+
 creds = ServiceAccountCredentials.from_json_keyfile_dict(google_creds, scope)
 client = gspread.authorize(creds)
+sheet = client.open("Andrey Tasks").sheet1
 
-# Открытие таблицы
-spreadsheet = client.open("Задачи Андрея")  # Название таблицы
-worksheet = spreadsheet.sheet1              # Первая вкладка
+# Telegram bot
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
-# Состояние диалога
-ADD_TASK = 1
+# Словарь задач {user_id: [{"task": "text", "done": False}]}
+tasks = {}
 
-# Команда /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Привет! Я бот Андрей. Напиши /add чтобы добавить задачу или /list чтобы посмотреть список.")
+    await update.message.reply_text("Привет! Я бот Андрей. Напиши /add чтобы добавить задачу.")
 
-# Команда /add
-async def add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Введи задачу:")
-    return ADD_TASK
+async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    task_text = ' '.join(context.args)
 
-async def save_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    task = update.message.text
-    user = update.effective_user.first_name
-    worksheet.append_row([user, task])
-    await update.message.reply_text("Задача сохранена!")
-    return ConversationHandler.END
-
-# Команда /list
-async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    records = worksheet.get_all_records()
-    if not records:
-        await update.message.reply_text("Список задач пуст.")
+    if not task_text:
+        await update.message.reply_text("Пожалуйста, укажи текст задачи: /add Сделать отчёт")
         return
 
-    message = "\n".join([f"{i+1}. {row['Задача']}" for i, row in enumerate(records)])
-    await update.message.reply_text(f"Вот твои задачи:\n{message}")
+    tasks.setdefault(user_id, []).append({"task": task_text, "done": False})
+    sheet.append_row([str(user_id), task_text, "FALSE"])
+    await update.message.reply_text("Задача добавлена!")
 
-# Отмена
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Добавление задачи отменено.")
-    return ConversationHandler.END
+async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user_tasks = tasks.get(user_id, [])
 
-# Запуск
+    if not user_tasks:
+        await update.message.reply_text("У тебя пока нет задач.")
+        return
+
+    buttons = [
+        [InlineKeyboardButton(f"{'✅' if t['done'] else '❌'} {t['task']}", callback_data=str(i))]
+        for i, t in enumerate(user_tasks)
+    ]
+    reply_markup = InlineKeyboardMarkup(buttons)
+    await update.message.reply_text("Вот твои задачи:", reply_markup=reply_markup)
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    index = int(query.data)
+    user_tasks = tasks.get(user_id, [])
+
+    if index < len(user_tasks):
+        user_tasks[index]["done"] = not user_tasks[index]["done"]
+        await query.edit_message_text(
+            text="Задача обновлена. Используй /list чтобы посмотреть ещё раз."
+        )
+
 def main():
-    token = os.environ["TELEGRAM_TOKEN"]  # Токен Telegram должен быть в переменных окружения
-    app = ApplicationBuilder().token(token).build()
+    app_bot = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("add", add)],
-        states={ADD_TASK: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_task)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
+    app_bot.add_handler(CommandHandler("start", start))
+    app_bot.add_handler(CommandHandler("add", add_task))
+    app_bot.add_handler(CommandHandler("list", list_tasks))
+    app_bot.add_handler(CallbackQueryHandler(button_handler))
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("list", list_tasks))
-    app.add_handler(conv_handler)
-
-    app.run_polling()
+    app_bot.run_polling()
 
 if __name__ == "__main__":
     main()
