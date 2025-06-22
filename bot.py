@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import asyncio
 from dotenv import load_dotenv
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
@@ -13,6 +14,7 @@ from flask import Flask, request
 
 # Логирование
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Загрузка переменных окружения
 load_dotenv()
@@ -27,56 +29,50 @@ credentials = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope
 client = gspread.authorize(credentials)
 sheet = client.open_by_key(SPREADSHEET_ID).sheet1
 
-# Flask-приложение для Webhook
+# Flask-приложение
 flask_app = Flask(__name__)
 WEBHOOK_URL = f"https://andrey-task-bot.onrender.com/webhook"
 
 # Состояния
 ADDING_TASK = 1
 
-# Команда /start
+# Обработчики
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [["➕ Новая задача"]]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     await update.message.reply_text("Привет! Я — Андрей, твой бот для задач. Чем могу помочь?", reply_markup=reply_markup)
 
-# Обработка обычных текстов
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text == "➕ Новая задача":
-        await update.message.reply_text("Напиши текст задачи:")
-        return ADDING_TASK
-    else:
-        await update.message.reply_text("Пожалуйста, используй кнопку '➕ Новая задача'.")
-        return ConversationHandler.END
+async def handle_new_task_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Напиши текст задачи:")
+    return ADDING_TASK
 
-# Добавление задачи
 async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    task_text = update.message.text.strip()
+    task_text = update.message.text
     user_id = update.effective_user.id
     sheet.append_row([str(user_id), task_text, "FALSE"])
-    await update.message.reply_text("✅ Задача добавлена!")
+    await update.message.reply_text("Задача добавлена!")
     return ConversationHandler.END
 
-# Отмена
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Операция отменена.")
+    await update.message.reply_text("Отменено.")
     return ConversationHandler.END
 
 # Webhook endpoint
 @flask_app.post("/webhook")
 def webhook():
     data = request.get_json(force=True)
-    flask_app.application.update_queue.put_nowait(data)
+    update = Update.de_json(data, flask_app.bot_app.bot)
+    asyncio.create_task(flask_app.bot_app.process_update(update))
     return "ok"
 
-# Запуск бота
+# Основной запуск
 async def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-    flask_app.application = app  # фикс для webhooks
+    flask_app.bot_app = app
 
+    # Обработчики
     conv_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)],
+        entry_points=[MessageHandler(filters.Regex("➕ Новая задача"), handle_new_task_button)],
         states={ADDING_TASK: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_task)]},
         fallbacks=[CommandHandler("cancel", cancel)],
     )
@@ -84,21 +80,13 @@ async def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(conv_handler)
 
+    # Webhook
     await app.bot.delete_webhook()
     await app.bot.set_webhook(url=WEBHOOK_URL)
 
-    logging.info("Бот Андрей запущен по Webhook...")
+    logger.info("Бот Андрей запущен по Webhook...")
 
+# Точка входа
 if __name__ == "__main__":
-    import asyncio
-    from threading import Thread
-
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    def run_bot():
-        loop.run_until_complete(main())
-
-    # Запускаем Flask и бота параллельно
-    Thread(target=run_bot).start()
+    asyncio.run(main())
     flask_app.run(host="0.0.0.0", port=10000)
