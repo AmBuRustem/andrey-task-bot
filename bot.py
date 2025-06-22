@@ -1,79 +1,93 @@
-import logging
-import json
 import os
-import time
+import json
+import logging
 from dotenv import load_dotenv
 from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters, ConversationHandler
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, ContextTypes,
+    MessageHandler, filters, ConversationHandler
+)
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+from flask import Flask, request
 
 # Логирование
 logging.basicConfig(level=logging.INFO)
 
-# Загрузка .env
+# Загрузка переменных окружения
 load_dotenv()
 BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
-GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON")
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
+google_creds_str = os.getenv("GOOGLE_CREDS_JSON")
 
-# Клавиатура
-keyboard = ReplyKeyboardMarkup(
-    keyboard=[
-        ["➕ Новая задача", "📋 Список задач"],
-        ["✅ Выполнить задачу", "❓ Помощь"]
-    ],
-    resize_keyboard=True
-)
+# Авторизация Google Sheets
+scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+creds_dict = json.loads(google_creds_str)
+credentials = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+client = gspread.authorize(credentials)
+sheet = client.open_by_key(SPREADSHEET_ID).sheet1
 
-# Авторизация в Google Sheets
-scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-google_creds = json.loads(GOOGLE_CREDS_JSON)
-creds = ServiceAccountCredentials.from_json_keyfile_dict(google_creds, scope)
-client = gspread.authorize(creds)
-sheet = client.open("Andrey Tasks").sheet1
+# Flask app для Webhook
+flask_app = Flask(__name__)
+WEBHOOK_URL = f"https://andrey-task-bot.onrender.com/webhook"
 
-# Состояние диалога
+# Состояния
 ADDING_TASK = 1
 
-# Команды
+# Хендлер старта
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Привет! Я — Андрей, твой бот для задач. Чем могу помочь?", reply_markup=keyboard)
+    keyboard = [["➕ Новая задача"]]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    await update.message.reply_text("Привет! Я бот Андрей. Нажми кнопку, чтобы добавить задачу.", reply_markup=reply_markup)
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Напиши /add чтобы добавить задачу.\nИли нажми кнопку ниже.")
+# Хендлер кнопки
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text == "➕ Новая задача":
+        await update.message.reply_text("Напиши текст задачи:")
+        return ADDING_TASK
 
-# Сценарий добавления задачи
-async def handle_add_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Хорошо! Напиши текст задачи:")
-    return ADDING_TASK
-
-async def handle_task_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    task = update.message.text
-    user_id = update.message.from_user.id
-    sheet.append_row([str(user_id), task, "FALSE"])
-    await update.message.reply_text("Задача добавлена!", reply_markup=keyboard)
+# Хендлер ввода задачи
+async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    task_text = update.message.text
+    user_id = update.effective_user.id
+    sheet.append_row([str(user_id), task_text, "FALSE"])
+    await update.message.reply_text("Задача добавлена!")
     return ConversationHandler.END
 
+# Хендлер отмены
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Добавление задачи отменено.", reply_markup=keyboard)
+    await update.message.reply_text("Отменено.")
     return ConversationHandler.END
+
+# Flask webhook endpoint
+@flask_app.post("/webhook")
+def webhook():
+    data = request.get_json(force=True)
+    flask_app.bot_app.update_queue.put_nowait(data)
+    return "ok"
 
 # Запуск
-def main():
+async def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+    flask_app.bot_app = app
 
+    # Команды и кнопки
     conv_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^➕ Новая задача$"), handle_add_button)],
-        states={ADDING_TASK: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_task_input)]},
+        entry_points=[MessageHandler(filters.Regex("➕ Новая задача"), handle_message)],
+        states={ADDING_TASK: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_task)]},
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(conv_handler)
 
-    logging.info("Бот запущен...")
-    app.run_polling()
+    # Удалим старые webhooks, если есть
+    await app.bot.delete_webhook()
+    await app.bot.set_webhook(url=WEBHOOK_URL)
 
+    logging.info("Бот Андрей запущен по Webhook...")
+
+# Точка входа
 if __name__ == "__main__":
-    main()
+    import asyncio
+    asyncio.run(main())
