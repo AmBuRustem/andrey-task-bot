@@ -13,7 +13,7 @@ logging.basicConfig(level=logging.INFO)
 
 # Загрузка .env
 load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON")
 
 # Клавиатура
