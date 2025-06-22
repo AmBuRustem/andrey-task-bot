@@ -19,6 +19,7 @@ load_dotenv()
 BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 google_creds_str = os.getenv("GOOGLE_CREDS_JSON")
+WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL") + "/webhook"
 
 # Авторизация Google Sheets
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
@@ -27,9 +28,9 @@ credentials = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope
 client = gspread.authorize(credentials)
 sheet = client.open_by_key(SPREADSHEET_ID).sheet1
 
-# Flask app для Webhook
+# Flask app
 flask_app = Flask(__name__)
-WEBHOOK_URL = f"https://andrey-task-bot.onrender.com/webhook"
+application = None  # глобальная переменная для доступа к Telegram Application
 
 # Состояния
 ADDING_TASK = 1
@@ -59,35 +60,35 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Отменено.")
     return ConversationHandler.END
 
-# Flask webhook endpoint
+# Webhook endpoint для Telegram
 @flask_app.post("/webhook")
 def webhook():
     data = request.get_json(force=True)
-    flask_app.bot_app.update_queue.put_nowait(data)
+    if application:
+        application.update_queue.put_nowait(data)
     return "ok"
 
-# Запуск
-async def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    flask_app.bot_app = app
+# Запуск Flask и Telegram бота
+async def start_bot():
+    global application
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # Команды и кнопки
+    # Хендлеры
     conv_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("➕ Новая задача"), handle_message)],
         states={ADDING_TASK: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_task)]},
         fallbacks=[CommandHandler("cancel", cancel)],
     )
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(conv_handler)
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(conv_handler)
-
-    # Удалим старые webhooks, если есть
-    await app.bot.delete_webhook()
-    await app.bot.set_webhook(url=WEBHOOK_URL)
+    await application.bot.delete_webhook()
+    await application.bot.set_webhook(url=WEBHOOK_URL)
 
     logging.info("Бот Андрей запущен по Webhook...")
 
-# Точка входа
 if __name__ == "__main__":
     import asyncio
-    asyncio.run(main())
+    loop = asyncio.get_event_loop()
+    loop.create_task(start_bot())
+    flask_app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
